@@ -111,18 +111,13 @@ def move_to_archive(img_path: Path, archive_dir: Path) -> Path:
 # -------------------- polling watcher (без watchdog) --------------------
 
 class Poller:
-    """
-    Простой опрос папки:
-    - Каждые POLL_INTERVAL секунд сканим INPUT_DIR
-    - Ждём стабилизации размера файла (STABLE_TICKS подряд)
-    - После этого конвертируем и переносим в архив
-    """
     POLL_INTERVAL = 0.5
     STABLE_TICKS = 3
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._seen: Dict[Path, Dict[str, int]] = {}  # path -> {"size": int, "stable": int}
+        self._seen: Dict[Path, Dict[str, int]] = {}
+        self._processing: set[Path] = set()  # <--- добавили
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -155,6 +150,9 @@ class Poller:
                 self._seen.pop(p, None)
 
     def _tick(self, path: Path):
+        if path in self._processing:  # уже обрабатывается
+            return
+
         try:
             size = path.stat().st_size
         except FileNotFoundError:
@@ -171,11 +169,16 @@ class Poller:
             rec["size"] = size
             rec["stable"] = 0
 
-        # когда файл стабилен N тиков — обрабатываем
         if rec["stable"] >= self.STABLE_TICKS:
-            # чтобы не обработать дважды
             self._seen.pop(path, None)
-            threading.Thread(target=process_file_sync, args=(path, self.settings), daemon=True).start()
+            self._processing.add(path)  
+            threading.Thread(target=self._process_once, args=(path,), daemon=True).start()
+    def _process_once(self, path: Path):
+        try:
+            process_file_sync(path, self.settings)
+        finally:
+            self._processing.discard(path)
+            
 
 def process_file_sync(path: Path, settings: Settings):
     try:
