@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local runtime
+inbox/
+archive/
+readyforinstagram/
+*_local/
+logs/
+
+# Secrets
+.env
+.env.*
