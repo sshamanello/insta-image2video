@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
+import queue
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,8 +26,11 @@ def log(msg: str):
 @dataclass
 class Settings:
     input_dir: Path
+    work_dir: Path
     ready_dir: Path
     archive_dir: Path
+    failed_dir: Path
+    tmp_dir: Path            # для ТГ-временок (вне inbox!)
     duration: int
     width: int
     height: int
@@ -38,10 +43,14 @@ def load_settings() -> Settings:
     input_dir = Path(os.getenv("INPUT_DIR", "./inbox")).resolve()
     ready_dir = Path(os.getenv("READY_DIR", "./readyforinstagram")).resolve()
     archive_dir = Path(os.getenv("ARCHIVE_DIR", "./archive")).resolve()
-    duration = int(os.getenv("DURATION_SECONDS", "10"))
+    work_dir = Path(os.getenv("WORK_DIR", "./work")).resolve()
+    failed_dir = Path(os.getenv("FAILED_DIR", "./failed")).resolve()
+    tmp_dir = Path(os.getenv("TMP_DIR", "./tmp")).resolve()
+
+    duration = int(os.getenv("DURATION_SECONDS", "12"))  # по умолчанию 12 сек
     width = int(os.getenv("WIDTH", "1080"))
     height = int(os.getenv("HEIGHT", "1920"))
-    fps = int(os.getenv("FPS", "30"))
+    fps = int(os.getenv("FPS", "25"))
     bot_token = os.getenv("BOT_TOKEN")
     owner_chat_id_env = os.getenv("OWNER_CHAT_ID")
     try:
@@ -49,13 +58,16 @@ def load_settings() -> Settings:
     except ValueError:
         owner_chat_id = None
 
-    for d in (input_dir, ready_dir, archive_dir):
+    for d in (input_dir, work_dir, ready_dir, archive_dir, failed_dir, tmp_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     return Settings(
         input_dir=input_dir,
+        work_dir=work_dir,
         ready_dir=ready_dir,
         archive_dir=archive_dir,
+        failed_dir=failed_dir,
+        tmp_dir=tmp_dir,
         duration=duration,
         width=width,
         height=height,
@@ -71,109 +83,130 @@ def check_ffmpeg():
         log("FFmpeg не найден в PATH. Установи ffmpeg и перезапусти.")
         sys.exit(1)
 
-def safe_stem(path: Path) -> str:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{path.stem}_{ts}"
+def unique_stem(path_or_name: str) -> str:
+    stem = Path(path_or_name).stem
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    uid = uuid.uuid4().hex[:8]
+    return f"{stem}_{ts}_{uid}"
 
-def build_ffmpeg_cmd(img_path: Path, out_path: Path, duration: int, width: int, height: int, fps: int, use_fallback: bool = False):
+def build_ffmpeg_cmd(img_path: Path, out_path: Path, duration: int, width: int, height: int, fps: int):
+    # Вертикаль 1080x1920, размытый фон + оригинал по центру
     w, h = width, height
-    
-    if use_fallback:
-        # Simple fallback command without complex filtering
-        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
-    else:
-        # Use simpler, more memory-efficient approach
-        vf = (
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease:eval=init,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0,"
-            f"split[main][blur];"
-            f"[blur]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=30:3[bg];"
-            f"[bg][main]overlay"
-        )
-    
+    vf = (
+        f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease[fg];"
+        f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
+        f"crop={w}:{h},boxblur=20:1[bg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
+    )
     return [
-        "ffmpeg", "-y",
-        # Memory and threading optimizations
-        "-threads", "4",
-        "-thread_queue_size", "512",
-        # Input
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error", "-stats",
         "-loop", "1",
         "-i", str(img_path),
         "-t", str(duration),
         "-r", str(fps),
-        # Video filters
-        "-vf", vf,
-        # Encoding settings
+        "-filter_complex", vf,
+        "-shortest",
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
+        "-b:v", "3M", "-maxrate", "3M", "-bufsize", "6M",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        # Memory optimization
-        "-max_muxing_queue_size", "1024",
         str(out_path),
     ]
 
 def convert_image_to_video(img_path: Path, ready_dir: Path, duration: int, width: int, height: int, fps: int) -> Path:
-    out_name = safe_stem(img_path) + ".mp4"
-    out_path = ready_dir / out_name
-    
-    # Try with complex filter first, then fallback to simple
-    for attempt, use_fallback in enumerate([False, True]):
-        cmd = build_ffmpeg_cmd(img_path, out_path, duration, width, height, fps, use_fallback)
-        log(f"FFmpeg ({'fallback' if use_fallback else 'primary'}): {' '.join(cmd)}")
-        
-        try:
-            result = subprocess.run(
-                cmd, 
-                check=True, 
-                capture_output=True, 
-                text=True, 
-                timeout=60  # 60 second timeout
-            )
-            if result.stderr:
-                log(f"FFmpeg warnings: {result.stderr[:200]}...")  # Log first 200 chars of stderr
-            return out_path  # Success!
-            
-        except subprocess.TimeoutExpired:
-            log(f"FFmpeg timeout for {img_path.name} (attempt {attempt + 1})")
-            if attempt == 1:  # Last attempt
-                raise
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr[:200] if e.stderr else 'Unknown error'
-            log(f"FFmpeg error for {img_path.name} (attempt {attempt + 1}): {error_msg}...")
-            if attempt == 1:  # Last attempt
-                raise
-        
-        # Clean up partial output file before retry
-        if out_path.exists():
-            try:
-                out_path.unlink()
-            except Exception:
-                pass
-    
-    # This should never be reached, but just in case
-    raise RuntimeError("All ffmpeg attempts failed")
+    out_path = ready_dir / (unique_stem(img_path) + ".mp4")
+    cmd = build_ffmpeg_cmd(img_path, out_path, duration, width, height, fps)
+    log("FFmpeg: " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    return out_path
 
-def move_to_archive(img_path: Path, archive_dir: Path) -> Path:
-    target = archive_dir / (safe_stem(img_path) + img_path.suffix.lower())
-    shutil.move(str(img_path), str(target))
-    return target
+def safe_move(src: Path, dst_dir: Path, keep_ext: bool = True) -> Path:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    name = unique_stem(src)
+    if keep_ext:
+        name += src.suffix.lower()
+    dst = dst_dir / name
+    os.replace(str(src), str(dst))  # атомарный перенос в пределах диска
+    return dst
+
+# -------------------- очередь работ (1 воркер) --------------------
+
+@dataclass
+class Job:
+    src_path: Path  # путь к файлу в WORK_DIR (мы всегда работаем из work/)
+    is_temp: bool   # был ли файл временным (например из ТГ), влияет только на логи
+
+class JobQueue:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.q: "queue.Queue[Job]" = queue.Queue()
+        self.worker = threading.Thread(target=self._worker, daemon=True)
+        self._stop = threading.Event()
+
+    def start(self):
+        self.worker.start()
+
+    def stop(self):
+        self._stop.set()
+        self.q.put(None)  # разблокировать
+        self.worker.join(timeout=2)
+
+    def add(self, job: Job):
+        self.q.put(job)
+
+    def _worker(self):
+        log("Worker: стартовал.")
+        while not self._stop.is_set():
+            job = self.q.get()
+            if job is None:
+                break
+            src = job.src_path
+            try:
+                log(f"Worker: обрабатываю {src.name}")
+                # Конвертация
+                video_path = convert_image_to_video(
+                    src, self.settings.ready_dir,
+                    self.settings.duration, self.settings.width, self.settings.height, self.settings.fps
+                )
+                # Успех → исходник в archive
+                safe_move(src, self.settings.archive_dir, keep_ext=True)
+                log(f"Worker: готово {video_path.name}")
+            except subprocess.CalledProcessError as e:
+                log(f"FFmpeg ошибка: {e}")
+                # Даже при ошибке переносим исходник в failed/, чтобы не зациклиться
+                try:
+                    safe_move(src, self.settings.failed_dir, keep_ext=True)
+                except Exception as e2:
+                    log(f"Не удалось перенести в failed/: {e2}")
+            except Exception as e:
+                log(f"Ошибка обработки {src.name}: {e}")
+                try:
+                    safe_move(src, self.settings.failed_dir, keep_ext=True)
+                except Exception as e2:
+                    log(f"Не удалось перенести в failed/: {e2}")
+            finally:
+                self.q.task_done()
 
 # -------------------- polling watcher (без watchdog) --------------------
 
 class Poller:
-    POLL_INTERVAL = 1.0  # Increased from 0.5 to reduce CPU usage
-    STABLE_TICKS = 2     # Reduced from 3 to process files faster
-    MAX_CONCURRENT = 2   # Limit concurrent processing to avoid memory issues
+    """
+    Простой опрос папки:
+    - Каждые POLL_INTERVAL секунд сканим INPUT_DIR
+    - Ждём стабилизации размера файла (STABLE_TICKS подряд)
+    - Как только файл стабилен — ПЕРЕНОСИМ его в WORK_DIR (claim) и ставим в очередь
+    """
+    POLL_INTERVAL = 0.5
+    STABLE_TICKS = 3
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, jobs: JobQueue):
         self.settings = settings
+        self.jobs = jobs
         self._seen: Dict[Path, Dict[str, int]] = {}
-        self._processing: set[Path] = set()  # <--- добавили
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._processing_lock = threading.Lock()  # Add lock for thread safety
 
     def start(self):
         self._thread.start()
@@ -183,7 +216,7 @@ class Poller:
         self._thread.join(timeout=2)
 
     def _run(self):
-        log("Polling watcher запущен.")
+        log("Polling watcher: запущен.")
         while not self._stop.is_set():
             try:
                 self._scan_once()
@@ -192,26 +225,16 @@ class Poller:
             time.sleep(self.POLL_INTERVAL)
 
     def _scan_once(self):
-        # учтём только файлы нужных расширений в корне input_dir
         for p in self.settings.input_dir.glob("*"):
             if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
                 self._tick(p)
 
-        # чистим трекер для файлов, которых больше нет
-        tracked = list(self._seen.keys())
-        for p in tracked:
+        # чистим трекер для исчезнувших файлов
+        for p in list(self._seen.keys()):
             if not p.exists():
                 self._seen.pop(p, None)
 
     def _tick(self, path: Path):
-        with self._processing_lock:
-            if path in self._processing:  # уже обрабатывается
-                return
-            
-            # Check if we're at max concurrent processing limit
-            if len(self._processing) >= self.MAX_CONCURRENT:
-                return
-
         try:
             size = path.stat().st_size
         except FileNotFoundError:
@@ -229,35 +252,19 @@ class Poller:
             rec["stable"] = 0
 
         if rec["stable"] >= self.STABLE_TICKS:
+            # Claim: переносим в WORK и ставим в очередь
             self._seen.pop(path, None)
-            with self._processing_lock:
-                self._processing.add(path)  
-            threading.Thread(target=self._process_once, args=(path,), daemon=True).start()
-    def _process_once(self, path: Path):
-        try:
-            process_file_sync(path, self.settings)
-        finally:
-            with self._processing_lock:
-                self._processing.discard(path)
-            
-
-def process_file_sync(path: Path, settings: Settings):
-    try:
-        log(f"Найден файл: {path.name}")
-        video_path = convert_image_to_video(
-            path, settings.ready_dir, settings.duration, settings.width, settings.height, settings.fps
-        )
-        move_to_archive(path, settings.archive_dir)
-        log(f"Готово: {video_path.name}")
-    except subprocess.CalledProcessError as e:
-        log(f"FFmpeg ошибка: {e}")
-    except Exception as e:
-        log(f"Ошибка обработки {path.name}: {e}")
+            try:
+                claimed = safe_move(path, self.settings.work_dir, keep_ext=True)
+                self.jobs.add(Job(src_path=claimed, is_temp=False))
+                log(f"Claimed: {claimed.name}")
+            except Exception as e:
+                log(f"Не удалось перенести в work/: {e}")
 
 # -------------------- Telegram bot --------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отправь мне фото — верну 4‑секундное вертикальное видео 1080×1920.")
+    await update.message.reply_text("Отправь мне фото — верну вертикальное видео. Длительность по умолчанию 12 сек. Настройка в .env (DURATION_SECONDS).")
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
@@ -266,7 +273,8 @@ def _best_photo_file(photos):
     return photos[-1] if photos else None
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    settings = context.application.bot_data.get("settings")
+    settings: Settings = context.application.bot_data["settings"]
+    jobs: JobQueue = context.application.bot_data["jobs"]
     try:
         message = update.message
         file_obj = None
@@ -283,17 +291,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return
 
-        tmp_dir = settings.input_dir / "_tg_tmp"
-        tmp_dir.mkdir(exist_ok=True)
-        tmp_img = tmp_dir / f"tg_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{suffix}"
-        await file_obj.download_to_drive(str(tmp_img))
+        # Скачиваем во временный файл вне inbox
+        tmp_name = f"tg_{unique_stem('image')}{suffix}"
+        tmp_path = settings.tmp_dir / tmp_name
+        await file_obj.download_to_drive(str(tmp_path))
 
-        video_path = convert_image_to_video(
-            tmp_img, settings.ready_dir, settings.duration, settings.width, settings.height, settings.fps
-        )
-        move_to_archive(tmp_img, settings.archive_dir)
+        # Сразу переносим в WORK и ставим в очередь (единый конвейер)
+        claimed = safe_move(tmp_path, settings.work_dir, keep_ext=True)
+        jobs.add(Job(src_path=claimed, is_temp=True))
+        await message.reply_text("Принял, конвертирую…")
 
-        await message.reply_video(video=open(video_path, "rb"), supports_streaming=True, caption="Готово ✅")
+        # Когда воркер закончит — пришлём видео
+        # Простой поллинг готового файла (имя видео заранее не знаем). Отправим самое свежее из ready_dir.
+        # Это простая стратегия, в продакшене можно делать корелляцию по id.
+        def find_latest_mp4(dirpath: Path) -> Optional[Path]:
+            mp4s = list(dirpath.glob("*.mp4"))
+            if not mp4s:
+                return None
+            return max(mp4s, key=lambda p: p.stat().st_mtime)
+
+        # подождём до 60 сек результат (обычно быстрее)
+        for _ in range(120):
+            latest = find_latest_mp4(settings.ready_dir)
+            if latest and datetime.now().timestamp() - latest.stat().st_mtime <= 70:
+                # отправим файл
+                await message.reply_video(video=open(latest, "rb"), supports_streaming=True, caption="Готово ✅")
+                break
+            await asyncio.sleep(0.5)
 
     except subprocess.CalledProcessError as e:
         await update.message.reply_text(f"FFmpeg ошибка: {e}")
@@ -302,22 +326,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- main --------------------
 
+import asyncio
+
 def main():
     check_ffmpeg()
     settings = load_settings()
 
     log(f"INPUT_DIR={settings.input_dir}")
+    log(f"WORK_DIR={settings.work_dir}")
     log(f"READY_DIR={settings.ready_dir}")
     log(f"ARCHIVE_DIR={settings.archive_dir}")
+    log(f"FAILED_DIR={settings.failed_dir}")
 
-    # запускаем poller
-    poller = Poller(settings)
+    # очередь + один воркер
+    jobs = JobQueue(settings)
+    jobs.start()
+
+    # поллер inbox
+    poller = Poller(settings, jobs)
     poller.start()
 
     # телеграм-бот (опционально)
     if settings.bot_token:
         app = Application.builder().token(settings.bot_token).build()
         app.bot_data["settings"] = settings
+        app.bot_data["jobs"] = jobs
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("ping", cmd_ping))
         photo_filter = filters.PHOTO | filters.Document.IMAGE
@@ -327,6 +360,7 @@ def main():
             app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
         finally:
             poller.stop()
+            jobs.stop()
     else:
         log("BOT_TOKEN не задан — бот не поднимаем. Watcher работает. Нажми Ctrl+C для выхода.")
         try:
@@ -336,6 +370,7 @@ def main():
             pass
         finally:
             poller.stop()
+            jobs.stop()
 
 if __name__ == "__main__":
     main()
